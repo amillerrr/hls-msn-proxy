@@ -19,9 +19,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/amillerrr/hls-msn-proxy/internal/proxy"
 	"github.com/amillerrr/hls-msn-proxy/internal/state"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -77,36 +77,34 @@ func main() {
 
 	// Health check — verifies Redis connectivity
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-
 		redisOK := stateMgr.RedisHealthy(r.Context())
 		streamCount := stateMgr.StreamCount()
 
 		status := "healthy"
-		httpCode := http.StatusOK
 
-		// If Redis is configured but down, report degraded
+		// If Redis is configured but down, report degraded.
+		// Still return 200 so ALB keeps instance in rotation.
+		// A degraded instance serving stale is better than no instance.
+		// The redis_connect_errors alarm will fire separately.
 		if cfg.RedisAddr != "" && !redisOK {
 			status = "degraded"
-			// Still return 200 so ALB keeps instance in rotation.
-			// A degraded instance serving stale is better than no instance.
-			// The redis_connect_errors alarm will fire separately.
 		}
 
+		w.Header().Set("Content-Type", "application/json")
+		// WriteHeader is implicitly 200 — no need to call explicitly.
 		json.NewEncoder(w).Encode(map[string]any{
 			"status":       status,
 			"redis":        redisOK,
 			"stream_count": streamCount,
 			"uptime":       time.Since(startTime).Round(time.Second).String(),
 		})
-		w.WriteHeader(httpCode)
 	})
 
 	// Deep health check — fails if Redis is down (for targeted alerting)
 	mux.HandleFunc("/health/deep", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-
 		redisOK := stateMgr.RedisHealthy(r.Context())
+
+		w.Header().Set("Content-Type", "application/json")
 
 		if cfg.RedisAddr != "" && !redisOK {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -259,7 +257,7 @@ func loadConfig() config {
 	cfg := config{
 		ListenAddr: envOr("LISTEN_ADDR", ":8080"),
 		RedisAddr:  envOr("REDIS_ADDR", ""),
-		StaleTTL:   30 * time.Second,
+		StaleTTL:   90 * time.Second,
 	}
 
 	// Parse upstreams from semicolon-separated list

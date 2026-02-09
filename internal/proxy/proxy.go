@@ -1,6 +1,12 @@
 // Package proxy provides the HTTP reverse proxy that intercepts HLS playlist
 // responses and applies MSN correction.
 //
+// Origin selection: consistent hashing on stream key ensures sequential playlist
+// fetches for the same rendition hit the same upstream packager. This prevents
+// segment content mismatches where different packagers serve different segment
+// URIs for the same timeline position. Failover to alternate origins happens
+// only when the pinned origin returns a 5xx or is unreachable.
+//
 // Fail-closed behavior:
 //   - Upstream success + state available → corrected playlist
 //   - Upstream success + no state (ErrNoState) → serve stale if available, else 503
@@ -12,6 +18,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"net/http"
@@ -21,10 +28,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/amillerrr/hls-msn-proxy/internal/rewriter"
 	"github.com/amillerrr/hls-msn-proxy/internal/state"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 // Metrics
@@ -49,7 +56,7 @@ var (
 		Name: "msn_proxy_upstream_errors_total",
 		Help: "Total upstream fetch failures",
 	})
-	passthrough = promauto.NewCounter(prometheus.CounterOpts{
+	passthroughCount = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "msn_proxy_passthrough_total",
 		Help: "Total playlists passed through unmodified (master/VOD)",
 	})
@@ -64,6 +71,14 @@ var (
 	baselineSource = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "msn_proxy_state_source_baseline_total",
 		Help: "New baseline states established",
+	})
+	originFailovers = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "msn_proxy_origin_failovers_total",
+		Help: "Times a request failed over to an alternate origin",
+	})
+	offsetExcessive = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "msn_proxy_offset_excessive_total",
+		Help: "Corrections where offset exceeded safe threshold",
 	})
 	requestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "msn_proxy_request_duration_seconds",
@@ -87,8 +102,8 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		StaleTTL:        30 * time.Second, // 5 playlist cycles at 6s target duration
-		UpstreamTimeout: 8 * time.Second,
+		StaleTTL:        90 * time.Second, // Covers Redis failover window (30-60s) with margin
+		UpstreamTimeout: 3 * time.Second,  // Under MediaTailor's default 4s origin timeout
 	}
 }
 
@@ -99,8 +114,11 @@ type Proxy struct {
 	logger *slog.Logger
 
 	reverseProxies []*httputil.ReverseProxy
-	currentOrigin  int
-	originMu       sync.Mutex
+
+	// Global round-robin counter for non-playlist requests (segments, etc.)
+	// where origin pinning doesn't matter since segment content is immutable.
+	passthroughOrigin int
+	passthroughMu     sync.Mutex
 
 	staleCache sync.Map // uri → *staleEntry
 }
@@ -159,9 +177,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // handlePlaylist fetches upstream, applies MSN correction, caches result.
 func (p *Proxy) handlePlaylist(w http.ResponseWriter, r *http.Request) {
 	uri := r.URL.Path
+	streamKey := cleanStreamKey(uri)
 
-	// Fetch from upstream
-	body, statusCode, err := p.fetchUpstream(r)
+	// Fetch from upstream using origin pinning (consistent hash on stream key)
+	body, statusCode, err := p.fetchUpstreamPinned(r, streamKey)
 	if err != nil || statusCode >= 500 {
 		upstreamErrors.Inc()
 		p.logger.Warn("upstream failed, trying stale",
@@ -186,7 +205,7 @@ func (p *Proxy) handlePlaylist(w http.ResponseWriter, r *http.Request) {
 
 	// Master playlists and VOD: pass through unmodified
 	if !parsed.IsMedia || parsed.IsVOD {
-		passthrough.Inc()
+		passthroughCount.Inc()
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		w.Header().Set("X-MSN-Proxy", "passthrough")
@@ -194,10 +213,8 @@ func (p *Proxy) handlePlaylist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Compute correction (atomic via Redis or local fallback)
-	streamKey := cleanStreamKey(uri)
+	// Compute correction (Redis pipeline or local fallback)
 	result, err := p.state.CorrectAndUpdate(r.Context(), streamKey, parsed)
-
 	if err != nil {
 		if err == state.ErrNoState {
 			// No state available and Redis is down. We cannot verify correctness.
@@ -239,6 +256,15 @@ func (p *Proxy) handlePlaylist(w http.ResponseWriter, r *http.Request) {
 			"corrected_msn", result.Correction.CorrectedMSN,
 			"offset", result.Correction.OffsetApplied,
 			"source", result.Source,
+		)
+	}
+
+	if result.Correction.OffsetExcessive {
+		offsetExcessive.Inc()
+		p.logger.Error("MSN offset exceeds safe threshold",
+			"stream", streamKey,
+			"offset", result.Correction.OffsetApplied,
+			"threshold", rewriter.MaxReasonableOffset,
 		)
 	}
 
@@ -295,57 +321,81 @@ func (p *Proxy) serveStaleOrFail(w http.ResponseWriter, uri string, errorCode in
 	w.Write(entry.body)
 }
 
-// fetchUpstream fetches the resource from the next available upstream.
-// Tries each upstream once on failure before giving up.
-func (p *Proxy) fetchUpstream(r *http.Request) (body []byte, status int, err error) {
-	for range p.reverseProxies {
-		rp := p.nextProxy()
+// fetchUpstreamPinned fetches a playlist from the origin pinned to the given
+// stream key (consistent hash). If the pinned origin fails, tries remaining
+// origins in order before giving up.
+func (p *Proxy) fetchUpstreamPinned(r *http.Request, streamKey string) (body []byte, status int, err error) {
+	n := len(p.reverseProxies)
+	primary := p.originIndexForStream(streamKey)
 
-		// Create a response recorder to capture the response
+	for attempt := 0; attempt < n; attempt++ {
+		idx := (primary + attempt) % n
+		rp := p.reverseProxies[idx]
+
 		rec := &responseRecorder{
 			header: make(http.Header),
+			status: 200, // default — Go's http may not call WriteHeader explicitly
 		}
 
 		rp.ServeHTTP(rec, r)
 
 		if rec.status >= 500 {
-			err = fmt.Errorf("upstream returned %d", rec.status)
-			continue // try next upstream
+			err = fmt.Errorf("upstream[%d] returned %d", idx, rec.status)
+			if attempt > 0 {
+				originFailovers.Inc()
+			}
+			continue // try next origin
 		}
 
-		body := rec.body.Bytes()
+		if attempt > 0 {
+			originFailovers.Inc()
+			p.logger.Warn("origin failover succeeded",
+				"stream", streamKey,
+				"primary_idx", primary,
+				"used_idx", idx,
+				"attempt", attempt+1,
+			)
+		}
+
+		respBody := rec.body.Bytes()
 
 		// Safety: decompress if upstream sent gzip despite DisableCompression
-		if rec.header.Get("Content-Encoding") == "gzip" && len(body) > 2 {
-			gr, gzErr := gzip.NewReader(bytes.NewReader(body))
+		if rec.header.Get("Content-Encoding") == "gzip" && len(respBody) > 2 {
+			gr, gzErr := gzip.NewReader(bytes.NewReader(respBody))
 			if gzErr == nil {
 				decompressed, readErr := io.ReadAll(gr)
 				gr.Close()
 				if readErr == nil {
-					body = decompressed
+					respBody = decompressed
 				}
 			}
 		}
 
-		return body, rec.status, nil
+		return respBody, rec.status, nil
 	}
 
 	return nil, 0, fmt.Errorf("all upstreams failed: %w", err)
 }
 
-// nextProxy returns the next upstream proxy (round-robin).
-func (p *Proxy) nextProxy() *httputil.ReverseProxy {
-	p.originMu.Lock()
-	defer p.originMu.Unlock()
-	rp := p.reverseProxies[p.currentOrigin%len(p.reverseProxies)]
-	p.currentOrigin++
-	return rp
+// originIndexForStream returns a stable origin index for a given stream key
+// using consistent hashing (FNV-1a). This ensures consecutive playlist fetches
+// for the same rendition go to the same packager, preventing segment content
+// mismatches when packagers produce segments with different URIs/cut points.
+func (p *Proxy) originIndexForStream(streamKey string) int {
+	h := fnv.New32a()
+	h.Write([]byte(streamKey))
+	return int(h.Sum32()) % len(p.reverseProxies)
 }
 
-// handlePassthrough proxies non-playlist content directly (segments, etc.).
+// handlePassthrough proxies non-playlist content directly (segments, keys, etc.).
+// Uses global round-robin since segment content is immutable once created.
 func (p *Proxy) handlePassthrough(w http.ResponseWriter, r *http.Request) {
-	rp := p.nextProxy()
-	rp.ServeHTTP(w, r)
+	p.passthroughMu.Lock()
+	idx := p.passthroughOrigin % len(p.reverseProxies)
+	p.passthroughOrigin++
+	p.passthroughMu.Unlock()
+
+	p.reverseProxies[idx].ServeHTTP(w, r)
 }
 
 // responseRecorder captures the upstream response for modification.
@@ -355,7 +405,7 @@ type responseRecorder struct {
 	status int
 }
 
-func (r *responseRecorder) Header() http.Header        { return r.header }
+func (r *responseRecorder) Header() http.Header         { return r.header }
 func (r *responseRecorder) WriteHeader(status int)      { r.status = status }
 func (r *responseRecorder) Write(b []byte) (int, error) { return r.body.Write(b) }
 
@@ -395,12 +445,3 @@ func (p *Proxy) PurgeStaleCache() int {
 
 // Ensure responseRecorder implements http.ResponseWriter
 var _ http.ResponseWriter = (*responseRecorder)(nil)
-
-// Ensure responseRecorder doesn't satisfy http.Flusher (we want buffering)
-// This is intentional — we need the full body to rewrite MSNs.
-
-// Add support for reading upstream response body
-func init() {
-	// Verify interface compliance at compile time
-	var _ io.Writer = (*responseRecorder)(nil)
-}
