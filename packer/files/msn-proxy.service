@@ -1,0 +1,37 @@
+[Unit]
+Description=HLS MSN Proxy — Monotonic Media Sequence Correction
+Documentation=https://github.com/your-org/hls-msn-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/msn-proxy
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+# Environment from file (written by Terraform user_data at launch)
+EnvironmentFile=/etc/msn-proxy/env
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/log
+
+# Resource limits
+MemoryMax=256M
+TasksMax=4096
+
+# Logging to journald → CloudWatch
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=msn-proxy
+
+[Install]
+WantedBy=multi-user.target

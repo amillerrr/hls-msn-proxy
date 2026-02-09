@@ -1,0 +1,44 @@
+# terraform.tfvars.example
+# Copy to terraform.tfvars and fill in your values.
+
+environment = "production"
+aws_region  = "us-east-1"
+
+vpc_id             = "vpc-0123456789abcdef0"
+private_subnet_ids = ["subnet-aaaa", "subnet-bbbb"]
+public_subnet_ids  = ["subnet-cccc", "subnet-dddd"]
+
+origin_servers = "packager1.internal:80;packager2.internal:80"
+
+# ---------------------------------------------------------------
+# AMI: Use Packer AMI (recommended) or fallback to raw AL2023
+# ---------------------------------------------------------------
+
+# Option A: Packer AMI (recommended — faster boot, immutable)
+# Build with: packer build -var 'binary_source=./msn-proxy' packer/
+# Then paste the AMI ID here:
+# ami_id = "ami-0123456789abcdef0"
+
+# Option B: Fallback (downloads binary from S3 at launch — slower boot)
+# Leave ami_id empty and set these:
+# binary_s3_bucket = "my-deploy-bucket"
+# binary_s3_key    = "hls-msn-proxy/msn-proxy"
+
+# ---------------------------------------------------------------
+# Instance / scaling
+# ---------------------------------------------------------------
+instance_type    = "t4g.micro"
+desired_capacity = 2
+min_size         = 2
+max_size         = 4
+
+key_pair_name = ""  # Use SSM instead
+
+redis_node_type    = "cache.t4g.micro"
+log_retention_days = 30
+
+tags = {
+  Team       = "video-engineering"
+  CostCenter = "streaming"
+  Platform   = "FAST"
+}
